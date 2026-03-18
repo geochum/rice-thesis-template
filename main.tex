@@ -1,0 +1,118 @@
+%===================================
+% Rice University Thesis Template
+%===================================
+\documentclass[12pt]{ruthesis} % Official Rice thesis class
+
+%===================================
+% Packages
+%===================================
+
+% Mathematics
+\usepackage{amsmath, amssymb, latexsym}
+\setlength{\emergencystretch}{2em} % Improves justified text line breaks
+
+% Graphics and Figures
+\usepackage{graphicx}  % Modern package for images
+\usepackage{subcaption} % Replaces outdated subfigure
+\usepackage{tabularx}   % Flexible width tables
+\usepackage{makecell}   % Line breaks within table cells
+\usepackage{booktabs}   % Professional table rules (\toprule, \midrule, \bottomrule)
+\usepackage{rotating}   % For rotated figures and tables
+\usepackage{float}      % For precise table/figure placement
+
+% Theorem Environments
+\usepackage{amsthm} % Better theorem management
+
+% Citations and Bibliography
+\usepackage[numbers]{natbib} % Improved citation handling
+
+% Modular Compilation
+\usepackage{subfiles} 
+
+% Hyperlinks
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue]{hyperref}
+\usepackage{bookmark}
+\bookmarksetup{startatroot}
+
+%===================================
+% Theorem Environments
+%===================================
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[chapter]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+%===================================
+% Thesis Metadata (edit these)
+%===================================
+\title{Your Thesis Title}
+\ctitle{Short Title} % Used for running headers
+\author{Your Name}
+\department{Department of Computational Applied Mathematics \& Operations Research}
+\school{Rice University}
+\degree{Master of Arts in Computational and Applied Mathematics and Operations Research}
+
+% Committee (use \and between members)
+\committee {
+    Committee Member 1, Chair \\
+    Title \and
+    Committee Member 2 \\
+    Title \and
+    Committee Member 3 \\
+    Title
+}
+
+\address{Houston, Texas}
+\donemonth{Month}  % e.g., May, December
+\doneyear{Year}   % e.g., 2025
+\makeindex
+
+%===================================
+% Begin Document
+%===================================
+\begin{document}
+
+  %===================================
+  % Front Matter
+  %===================================
+  \begin{frontmatter}
+    \pagenumbering{roman} % Use Roman numerals for front matter
+    \maketitle
+    \include{frontmatter/abstract}
+    \include{frontmatter/acknowledgments}
+    \tableofcontents
+    \listoffigures
+    \listoftables
+    % \include{frontmatter/dedication}
+  \end{frontmatter}
+
+%===================================
+% Main Content
+%===================================
+\pagenumbering{arabic} % Start Arabic numbering for main content
+\linespacing{1.7} % Set line spacing
+
+\subfile{chapters/chapter1}
+% \subfile{chapters/chapter2}
+% \subfile{chapters/chapter3}
+
+%===================================
+% Appendices (Optional)
+%===================================
+\appendix
+
+\subfile{appendices/appendix_a}
+% \subfile{appendices/appendix_b}
+
+%===================================
+% Bibliography
+%===================================
+\bibliographystyle{IEEEtranN} % IEEE-style with \citet support
+\bibliography{bibliography} % Bibliography file
+
+\end{document}

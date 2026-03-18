@@ -1,0 +1,47 @@
+# LaTeX
+*.aux
+*.lof
+*.log
+*.lot
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex
+*.synctex.gz
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.idx
+*.ilg
+*.ind
+*.dvi
+*.xdv
+**/.build/
+**/latex.out/
+
+# Obsidian
+**/.obsidian/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+**/$RECYCLE.BIN/
+
+# Editors
+**/.vscode/
+**/.idea/
+**/.cursor/
+*.bak
+*~
+
+# Scripts / temp
+**/__pycache__/
+**/.venv/
+.env
+*.tmp
+*.temp
+*.swp
+*.swo
