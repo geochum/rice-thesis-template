@@ -1,130 +1,149 @@
-#!/bin/bash
-# Build script for Rice University Thesis (Bash version)
-# Compiles LaTeX to a build directory (PDF and auxiliary files stay in .build/)
-# Usage: ./build.sh [path/to/file.tex]
-#        If no argument provided, checks for .tex files in the current directory
+#!/usr/bin/env bash
+# Usage: ./build.sh [--verbose] [path/to/file.tex]
+# PDF goes to .build/. Optional: LATEXMK_BIN=/path/to/latexmk
+# Quiet by default. Pass --verbose (-v) to stream latexmk output.
 
-TEX_FILE="$1"
+set -euo pipefail
 
-# Get the .tex file path from first argument or find one in current directory
-if [ -z "$TEX_FILE" ]; then
-    # Find all .tex files in current directory (portable: no mapfile)
-    tex_files=()
-    while IFS= read -r line; do
-        tex_files+=("$line")
-    done < <(find . -maxdepth 1 -name "*.tex" -type f | sort)
-    
-    if [ ${#tex_files[@]} -eq 0 ]; then
-        TEX_FILE=""
-    elif [ ${#tex_files[@]} -eq 1 ]; then
-        # Only one file, use it (remove ./ prefix)
-        TEX_FILE="${tex_files[0]#./}"
+build_self_name() {
+    basename "${BASH_SOURCE[0]}"
+}
+
+build_usage() {
+    echo "Usage: ./$(build_self_name) [--verbose] [path/to/file.tex]"
+}
+
+build_path_sep() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*|Windows_NT) printf ';' ;;
+        *) printf ':' ;;
+    esac
+}
+
+build_abspath() {
+    local path="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path"
+    elif [ -d "$path" ]; then
+        (cd "$path" && pwd)
     else
-        # Multiple files found - prompt user to choose (style matches compilation output)
-        echo ""
-        echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
-        echo -e "\033[1;36m  Select .tex file to build\033[0m"
-        echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
-        echo ""
-        for i in "${!tex_files[@]}"; do
-            echo -e "  \033[2m[$((i+1))]\033[0m \033[36m${tex_files[i]#./}\033[0m"
-        done
-        echo ""
-        read -p "  Select (1-${#tex_files[@]}) or Enter to cancel: " selection
-        
-        if [ -z "$selection" ] || [ "$selection" = "q" ] || [ "$selection" = "Q" ]; then
-            echo -e "\033[90mBuild cancelled.\033[0m"
-            exit 0
-        fi
-        
-        selected_index=$((selection - 1))
-        if [ "$selected_index" -ge 0 ] 2>/dev/null && [ "$selected_index" -lt ${#tex_files[@]} ]; then
-            TEX_FILE="${tex_files[$selected_index]#./}"
-            echo -e "\033[32mSelected: $TEX_FILE\033[0m"
-        else
-            echo -e "\033[31mInvalid selection. Build cancelled.\033[0m"
-            exit 1
-        fi
+        echo "$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
     fi
-fi
+}
 
-if [ -z "$TEX_FILE" ] || [ ! -f "$TEX_FILE" ]; then
-    echo -e "\033[31mError: No .tex file found. Usage: ./build.sh [filename.tex]\033[0m"
-    exit 1
-fi
-
-# Save the original directory to return to it later
-ORIGINAL_DIR=$(pwd)
-
-# Get absolute path and extract directory and basename
-if command -v realpath >/dev/null 2>&1; then
-    TEX_FILE_ABS=$(realpath "$TEX_FILE")
-else
-    # Fallback for systems without realpath (like older macOS)
-    if [ -d "$TEX_FILE" ]; then
-        TEX_FILE_ABS=$(cd "$TEX_FILE" && pwd)
+# Windows TeX (MiKTeX) needs drive-letter paths in TEXINPUTS/BIBINPUTS.
+build_engine_path() {
+    local path="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$path"
     else
-        TEX_FILE_ABS=$(cd "$(dirname "$TEX_FILE")" && pwd)/$(basename "$TEX_FILE")
+        printf '%s\n' "$path"
     fi
-fi
-TEX_DIR=$(dirname "$TEX_FILE_ABS")
-BASE_NAME=$(basename "$TEX_FILE_ABS" .tex)
-BUILD_DIR="$TEX_DIR/.build"
+}
 
-# Create build directory and subdirs for \include{}/\subfile{} paths (LaTeX won't create parent dirs)
-mkdir -p "$BUILD_DIR"
-if [ -f "$TEX_FILE_ABS" ]; then
-  grep -oE '\\(include|subfile)\{[^}]+\}' "$TEX_FILE_ABS" 2>/dev/null | \
-  sed -E 's/.*\{([^}]+)\}/\1/' | \
-  while read -r path; do
-    dir=$(dirname "$path")
-    if [ -n "$dir" ] && [ "$dir" != "." ]; then
-      mkdir -p "$BUILD_DIR/$dir"
+# Walk up from dir; skip $HOME so a user latexmkrc is not a project root.
+build_find_project_root() {
+    local dir="$1"
+    local home="${HOME:-}"
+    while [ -n "$dir" ]; do
+        if [ -n "$home" ] && [ "$dir" = "$home" ]; then
+            return 1
+        fi
+        if [ -f "$dir/.latexmkrc" ] || [ -f "$dir/latexmkrc" ]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        if [ -f "$dir/main.tex" ]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        local parent
+        parent="$(dirname "$dir")"
+        if [ "$parent" = "$dir" ]; then
+            return 1
+        fi
+        dir="$parent"
+    done
+    return 1
+}
+
+build_rc_file() {
+    local root="$1"
+    if [ -f "$root/.latexmkrc" ]; then
+        printf '%s\n' "$root/.latexmkrc"
+    elif [ -f "$root/latexmkrc" ]; then
+        printf '%s\n' "$root/latexmkrc"
     fi
-  done
-fi
+}
 
-# Find project root (directory containing main.tex)
-PROJECT_ROOT="$ORIGINAL_DIR"
-while [ -n "$PROJECT_ROOT" ] && [ ! -f "$PROJECT_ROOT/main.tex" ]; do
-    PARENT=$(dirname "$PROJECT_ROOT")
-    # Stop if we've reached the root directory (dirname of / is still /)
-    if [ "$PARENT" = "$PROJECT_ROOT" ]; then
-        PROJECT_ROOT=""
-        break
+build_prepend_search_path() {
+    local var="$1"
+    local root="$2"
+    local sep
+    sep="$(build_path_sep)"
+    local current="${!var:-}"
+    if [ -z "$current" ]; then
+        export "$var=${root}${sep}"
+    else
+        export "$var=${root}${sep}${current}"
     fi
-    PROJECT_ROOT="$PARENT"
-done
+}
 
-# Change to the directory containing the .tex file for compilation
-cd "$TEX_DIR" || exit 1
+build_discover_tex_path() {
+    local extra=()
+    [ -d /Library/TeX/texbin ] && extra+=("/Library/TeX/texbin")
 
-# Compile to build directory
-TEX_FILE_NAME=$(basename "$TEX_FILE_ABS")
-echo ""
-echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
-echo -e "\033[1;36m  Compiling: \033[0m\033[36m$TEX_FILE_NAME\033[0m"
-echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    local d
+    for d in /usr/local/texlive/*/bin/*; do
+        [ -d "$d" ] && extra+=("$d")
+    done
 
-# Set TEXINPUTS to include project root so subfiles can find included files
-if [ -n "$PROJECT_ROOT" ]; then
-    export TEXINPUTS="$PROJECT_ROOT:$TEXINPUTS"
-    export BIBINPUTS="$PROJECT_ROOT:$BIBINPUTS"
-fi
+    local miktex=""
+    if [ -n "${LOCALAPPDATA:-}" ]; then
+        miktex="${LOCALAPPDATA}/Programs/MiKTeX/miktex/bin/x64"
+    fi
+    if [ -z "$miktex" ] || [ ! -d "$miktex" ]; then
+        miktex="${HOME}/AppData/Local/Programs/MiKTeX/miktex/bin/x64"
+    fi
+    [ -d "$miktex" ] && extra+=("$miktex")
 
-# Start timing
-START_TIME=$(date +%s)
+    local p
+    for p in "${extra[@]}"; do
+        PATH="${p}:$PATH"
+    done
+    export PATH
+}
 
-# Helper function to safely count pattern matches
-count_pattern() {
+build_resolve_latexmk() {
+    if [ -n "${LATEXMK_BIN:-}" ]; then
+        if [ -x "$LATEXMK_BIN" ] || command -v "$LATEXMK_BIN" >/dev/null 2>&1; then
+            printf '%s\n' "$LATEXMK_BIN"
+            return 0
+        fi
+        echo "Error: LATEXMK_BIN is set but not executable: $LATEXMK_BIN" >&2
+        return 1
+    fi
+    if command -v latexmk >/dev/null 2>&1; then
+        command -v latexmk
+        return 0
+    fi
+    build_discover_tex_path
+    if command -v latexmk >/dev/null 2>&1; then
+        command -v latexmk
+        return 0
+    fi
+    echo "Error: latexmk is not installed or not on PATH" >&2
+    echo "  MacTeX: /Library/TeX/texbin   TeX Live: /usr/local/texlive/*/bin/*" >&2
+    echo "  Windows: install MiKTeX or TeX Live and reopen the terminal" >&2
+    return 1
+}
+
+build_count_pattern() {
     local pattern="$1"
     local file="$2"
     local count=0
     if [ -f "$file" ]; then
-        # Use grep with wc -l to always get a number, even if 0 matches
-        # xargs trims whitespace, ensuring we get a clean number
-        count=$(grep -E "$pattern" "$file" 2>/dev/null | wc -l | xargs)
-        # Ensure count is a valid number, default to 0 if not
+        count="$(grep -E -c "$pattern" "$file" 2>/dev/null || true)"
         if ! [[ "$count" =~ ^[0-9]+$ ]]; then
             count=0
         fi
@@ -132,150 +151,364 @@ count_pattern() {
     echo "$count"
 }
 
-# First pass: pdflatex
-echo -e "  \033[2m[1/3]\033[0m Running pdflatex..."
-pdflatex -output-directory="$BUILD_DIR" -interaction=nonstopmode -synctex=1 "$TEX_FILE_NAME" >/dev/null 2>&1
-
-# Check if bibliography needs to be compiled (for main.tex or files using natbib)
-if [ "$TEX_FILE_NAME" = "main.tex" ] || [ "$BASE_NAME" = "main" ]; then
-    echo -e "  \033[2m[   ]\033[0m Running bibtex..."
-    bibtex -output-directory="$BUILD_DIR" "$BASE_NAME" >/dev/null 2>&1
-fi
-
-# Second pass: pdflatex (to incorporate bibliography)
-echo -e "  \033[2m[2/3]\033[0m Running pdflatex..."
-pdflatex -output-directory="$BUILD_DIR" -interaction=nonstopmode -synctex=1 "$TEX_FILE_NAME" >/dev/null 2>&1
-
-# Third pass: pdflatex (to resolve all references)
-echo -e "  \033[2m[3/3]\033[0m Running pdflatex..."
-pdflatex -output-directory="$BUILD_DIR" -interaction=nonstopmode -synctex=1 "$TEX_FILE_NAME" >/dev/null 2>&1
-
-# Check if PDF was created
-PDF_PATH="$BUILD_DIR/$BASE_NAME.pdf"
-LOG_PATH="$BUILD_DIR/$BASE_NAME.log"
-
-if [ -f "$PDF_PATH" ]; then
-    # Calculate compilation time (integer seconds)
-    END_TIME=$(date +%s)
-    ELAPSED=$((END_TIME - START_TIME))
-    
-    # Get PDF size (format to match du -h output: "200K" or "1.2M")
-    SIZE_BYTES=$(stat -f%z "$PDF_PATH" 2>/dev/null || stat -c%s "$PDF_PATH" 2>/dev/null)
-    if [ -z "$SIZE_BYTES" ]; then
-        PDF_SIZE=""
-    elif [ "$SIZE_BYTES" -lt 1024 ]; then
-        PDF_SIZE="${SIZE_BYTES}"
-    elif [ "$SIZE_BYTES" -lt 1048576 ]; then
-        PDF_SIZE="$((SIZE_BYTES / 1024))K"
+build_pdf_size() {
+    local pdf="$1"
+    local size_bytes
+    size_bytes="$(stat -f%z "$pdf" 2>/dev/null || stat -c%s "$pdf" 2>/dev/null || true)"
+    if [ -z "$size_bytes" ]; then
+        return 0
+    fi
+    if [ "$size_bytes" -lt 1024 ]; then
+        echo "$size_bytes"
+    elif [ "$size_bytes" -lt 1048576 ]; then
+        echo "$((size_bytes / 1024))K"
     else
-        # Calculate MB with one decimal place, using awk if bc is not available
         if command -v bc >/dev/null 2>&1; then
-            SIZE_MB=$(echo "scale=1; $SIZE_BYTES / 1048576" | bc)
-            PDF_SIZE=$(echo "$SIZE_MB" | sed 's/\.0$//')M
+            local size_mb
+            size_mb="$(echo "scale=1; $size_bytes / 1048576" | bc)"
+            echo "$(echo "$size_mb" | sed 's/\.0$//')M"
         else
-            # Fallback using awk for floating point division
-            SIZE_MB=$(awk "BEGIN {printf \"%.1f\", $SIZE_BYTES / 1048576}")
-            PDF_SIZE=$(echo "$SIZE_MB" | sed 's/\.0$//')M
+            local size_mb
+            size_mb="$(awk "BEGIN {printf \"%.1f\", $size_bytes / 1048576}")"
+            echo "$(echo "$size_mb" | sed 's/\.0$//')M"
         fi
     fi
-    
-    # Try to get page count (multiple methods for compatibility)
-    PAGE_COUNT=""
+}
+
+build_page_count() {
+    local pdf="$1"
+    local n=""
     if command -v pdfinfo >/dev/null 2>&1; then
-        PAGE_COUNT=$(pdfinfo "$PDF_PATH" 2>/dev/null | grep "^Pages:" | awk '{print $2}')
+        n="$(pdfinfo "$pdf" 2>/dev/null | awk '/^Pages:/{print $2}' || true)"
     elif command -v pdftk >/dev/null 2>&1; then
-        PAGE_COUNT=$(pdftk "$PDF_PATH" dump_data 2>/dev/null | grep "NumberOfPages" | awk '{print $2}')
+        n="$(pdftk "$pdf" dump_data 2>/dev/null | awk '/NumberOfPages/{print $2}' || true)"
     fi
-    
-    # Parse log file for errors and warnings
-    if [ -f "$LOG_PATH" ]; then
-        ERROR_COUNT=$(count_pattern "^!" "$LOG_PATH")
-        # Count all types of warnings: LaTeX warnings, package warnings, overfull/underfull boxes, font issues, missing characters
-        WARNING_COUNT=0
-        count=$(count_pattern "^LaTeX Warning:" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Package .* Warning:" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Overfull" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Underfull" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Font shape" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Missing character" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        
-        echo ""
-        echo -e "\033[1;32m✓ Success\033[0m"
-        
-        # One-line summary: filename · pages · size · time
-        SUMMARY="$BASE_NAME.pdf"
-        [ -n "$PAGE_COUNT" ] && SUMMARY="$SUMMARY · ${PAGE_COUNT} page(s)"
-        [ -n "$PDF_SIZE" ]  && SUMMARY="$SUMMARY · $PDF_SIZE"
-        [ "$ELAPSED" -gt 0 ] && SUMMARY="$SUMMARY · ${ELAPSED}s"
-        echo -e "  \033[2m$SUMMARY\033[0m"
-        echo ""
-        
-        # Short path for display: relative to ORIGINAL_DIR if under it, else basename
-        if [[ "$PDF_PATH" == "$ORIGINAL_DIR"* ]]; then
-            DISPLAY_PATH="${PDF_PATH#$ORIGINAL_DIR/}"
-        else
-            DISPLAY_PATH="$BASE_NAME.pdf (in .build/)"
-        fi
-        echo -e "  \033[1mOutput:\033[0m"
-        echo -e "    \033[2mFile:\033[0m   $DISPLAY_PATH"
-        [ -n "$PAGE_COUNT" ] && printf "    \033[2m%-6s\033[0m %s\n" "Pages:" "$PAGE_COUNT"
-        [ -n "$PDF_SIZE" ]  && printf "    \033[2m%-6s\033[0m %s\n" "Size:"  "$PDF_SIZE"
-        [ "$ELAPSED" -gt 0 ] && printf "    \033[2m%-6s\033[0m %s\n" "Time:"  "${ELAPSED}s"
-        
-        # Show warnings/errors if present
-        if [ "$ERROR_COUNT" -gt 0 ] || [ "$WARNING_COUNT" -gt 0 ]; then
+    printf '%s\n' "$n"
+}
+
+build_pick_tex() {
+    local tex_files=()
+    local line
+    while IFS= read -r line; do
+        tex_files+=("$line")
+    done < <(find . -maxdepth 1 -name "*.tex" -type f | sort)
+
+    if [ ${#tex_files[@]} -eq 0 ]; then
+        echo "Error: No .tex file found. $(build_usage)" >&2
+        return 1
+    fi
+    if [ ${#tex_files[@]} -eq 1 ]; then
+        echo "${tex_files[0]#./}"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        echo "Error: Multiple .tex files; pass a path (non-interactive)." >&2
+        local i
+        for i in "${!tex_files[@]}"; do
+            echo "  ${tex_files[i]#./}" >&2
+        done
+        return 1
+    fi
+
+    echo "" >&2
+    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m" >&2
+    echo -e "\033[1;36m  Select .tex file to build\033[0m" >&2
+    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m" >&2
+    echo "" >&2
+    local i
+    for i in "${!tex_files[@]}"; do
+        echo -e "  \033[2m[$((i + 1))]\033[0m \033[36m${tex_files[i]#./}\033[0m" >&2
+    done
+    echo "" >&2
+    local selection
+    read -r -p "  Select (1-${#tex_files[@]}) or Enter to cancel: " selection
+    if [ -z "$selection" ] || [ "$selection" = "q" ] || [ "$selection" = "Q" ]; then
+        echo -e "\033[90mBuild cancelled.\033[0m" >&2
+        return 2
+    fi
+    local selected_index=$((selection - 1))
+    if [ "$selected_index" -ge 0 ] 2>/dev/null && [ "$selected_index" -lt ${#tex_files[@]} ]; then
+        echo -e "\033[32mSelected: ${tex_files[$selected_index]#./}\033[0m" >&2
+        echo "${tex_files[$selected_index]#./}"
+        return 0
+    fi
+    echo -e "\033[31mInvalid selection. Build cancelled.\033[0m" >&2
+    return 1
+}
+
+build_warn_error_counts() {
+    local log_path="$1"
+    local error_count warning_count count
+    error_count="$(build_count_pattern "^!" "$log_path")"
+    warning_count=0
+    count="$(build_count_pattern "^LaTeX Warning:" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    count="$(build_count_pattern "^Package .* Warning:" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    count="$(build_count_pattern "^Overfull" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    count="$(build_count_pattern "^Underfull" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    count="$(build_count_pattern "^Font shape" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    count="$(build_count_pattern "^Missing character" "$log_path")"
+    warning_count=$((warning_count + ${count:-0}))
+    echo "$error_count $warning_count"
+}
+
+build_report_success() {
+    local original_dir="$1"
+    local pdf_path="$2"
+    local log_path="$3"
+    local base_name="$4"
+    local elapsed="$5"
+
+    local pdf_size page_count
+    pdf_size="$(build_pdf_size "$pdf_path")"
+    page_count="$(build_page_count "$pdf_path")"
+
+    echo ""
+    echo -e "\033[1;32m✓ Success\033[0m"
+
+    local summary="$base_name.pdf"
+    [ -n "$page_count" ] && summary="$summary · ${page_count} page(s)"
+    [ -n "$pdf_size" ] && summary="$summary · $pdf_size"
+    [ "$elapsed" -gt 0 ] && summary="$summary · ${elapsed}s"
+    echo -e "  \033[2m$summary\033[0m"
+    echo ""
+
+    local display_path
+    if [[ "$pdf_path" == "$original_dir"* ]]; then
+        display_path="${pdf_path#$original_dir/}"
+    else
+        display_path="$base_name.pdf (in .build/)"
+    fi
+    echo -e "  \033[1mOutput:\033[0m"
+    echo -e "    \033[2mFile:\033[0m   $display_path"
+    [ -n "$page_count" ] && printf "    \033[2m%-6s\033[0m %s\n" "Pages:" "$page_count"
+    [ -n "$pdf_size" ] && printf "    \033[2m%-6s\033[0m %s\n" "Size:" "$pdf_size"
+    [ "$elapsed" -gt 0 ] && printf "    \033[2m%-6s\033[0m %s\n" "Time:" "${elapsed}s"
+
+    if [ -f "$log_path" ]; then
+        local counts error_count warning_count
+        counts="$(build_warn_error_counts "$log_path")"
+        error_count="${counts%% *}"
+        warning_count="${counts##* }"
+        if [ "$error_count" -gt 0 ] || [ "$warning_count" -gt 0 ]; then
             echo ""
             echo -e "  \033[1;33m⚠ Issues:\033[0m"
-            [ "$ERROR_COUNT" -gt 0 ]   && echo -e "    \033[31mErrors:\033[0m   $ERROR_COUNT"
-            [ "$WARNING_COUNT" -gt 0 ]  && echo -e "    \033[33mWarnings:\033[0m $WARNING_COUNT"
-            echo -e "    \033[2mLog:\033[0m     $LOG_PATH"
+            [ "$error_count" -gt 0 ] && echo -e "    \033[31mErrors:\033[0m   $error_count"
+            [ "$warning_count" -gt 0 ] && echo -e "    \033[33mWarnings:\033[0m $warning_count"
+            echo -e "    \033[2mLog:\033[0m     $log_path"
         fi
-    else
-        echo ""
-        echo -e "\033[1;32m✓ Success\033[0m"
-        SUMMARY="$BASE_NAME.pdf"
-        [ -n "$PDF_SIZE" ] && SUMMARY="$SUMMARY · $PDF_SIZE"
-        echo -e "  \033[2m$SUMMARY\033[0m"
-        echo ""
-        if [[ "$PDF_PATH" == "$ORIGINAL_DIR"* ]]; then
-            DISPLAY_PATH="${PDF_PATH#$ORIGINAL_DIR/}"
-        else
-            DISPLAY_PATH="$BASE_NAME.pdf (in .build/)"
-        fi
-        echo -e "  \033[1mOutput:\033[0m"
-        echo -e "    \033[2mFile:\033[0m   $DISPLAY_PATH"
-        [ -n "$PDF_SIZE" ] && printf "    \033[2m%-6s\033[0m %s\n" "Size:" "$PDF_SIZE"
     fi
-else
+}
+
+build_print_log_excerpt() {
+    local log_path="$1"
+    local max_lines="${2:-8}"
+    if [ ! -f "$log_path" ]; then
+        return 1
+    fi
+    local start=""
+    start="$(grep -n -E '^!' "$log_path" 2>/dev/null | head -n 1 | cut -d: -f1)" || true
+    if [ -z "$start" ]; then
+        return 1
+    fi
+    echo -e "  \033[1mLog excerpt:\033[0m"
+    awk -v start="$start" -v max="$max_lines" '
+        NR < start { next }
+        printed > 2 && ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*\*+/ || $0 ~ /^\[/) { exit }
+        { print "    " $0; printed++; if (printed >= max) exit }
+    ' "$log_path"
+}
+
+build_report_failure() {
+    local log_path="$1"
+    local capture_path="${2:-}"
     echo ""
     echo -e "\033[1;31m✗ Compilation Failed\033[0m"
     echo ""
-    if [ -f "$LOG_PATH" ]; then
-        ERROR_COUNT=$(count_pattern "^!" "$LOG_PATH")
-        # Count all types of warnings: LaTeX warnings, package warnings, overfull/underfull boxes, font issues, missing characters
-        WARNING_COUNT=0
-        count=$(count_pattern "^LaTeX Warning:" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Package .* Warning:" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Overfull" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Underfull" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Font shape" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        count=$(count_pattern "^Missing character" "$LOG_PATH"); WARNING_COUNT=$((WARNING_COUNT + ${count:-0}))
-        
+    if [ -f "$log_path" ]; then
+        local counts error_count warning_count
+        counts="$(build_warn_error_counts "$log_path")"
+        error_count="${counts%% *}"
+        warning_count="${counts##* }"
         echo -e "  \033[1mIssues Found:\033[0m"
-        if [ "$ERROR_COUNT" -gt 0 ]; then
-            echo -e "    \033[31mErrors:\033[0m   $ERROR_COUNT"
+        [ "$error_count" -gt 0 ] && echo -e "    \033[31mErrors:\033[0m   $error_count"
+        [ "$warning_count" -gt 0 ] && echo -e "    \033[33mWarnings:\033[0m $warning_count"
+        echo -e "    \033[2mLog:\033[0m      $log_path"
+        echo ""
+        local excerpt_status=0
+        build_print_log_excerpt "$log_path" || excerpt_status=$?
+        if [ "$excerpt_status" -ne 0 ] || { [ -n "$capture_path" ] && [ -f "$capture_path" ] && grep -Fq "pdflatex not found" "$capture_path"; }; then
+            if [ -n "$capture_path" ] && [ -f "$capture_path" ]; then
+                echo -e "  \033[1mlatexmk output:\033[0m"
+                head -n 40 "$capture_path" | sed 's/^/    /'
+            fi
         fi
-        if [ "$WARNING_COUNT" -gt 0 ]; then
-            echo -e "    \033[33mWarnings:\033[0m $WARNING_COUNT"
-        fi
-        echo -e "    \033[2mLog:\033[0m      $LOG_PATH"
     else
-        echo -e "  \033[2mLog file not found: $LOG_PATH\033[0m"
+        echo -e "  \033[2mLog file not found: $log_path\033[0m"
+        if [ -n "$capture_path" ] && [ -f "$capture_path" ]; then
+            echo ""
+            echo -e "  \033[1mlatexmk output:\033[0m"
+            head -n 40 "$capture_path" | sed 's/^/    /'
+        fi
     fi
     echo ""
-    cd "$ORIGINAL_DIR" || exit 1
-    exit 1
-fi
+    echo -e "  \033[2mRe-run with --verbose to stream latexmk.\033[0m"
+    echo ""
+}
 
-# Return to the original directory
-cd "$ORIGINAL_DIR" || exit 1
+build_main() {
+    local tex_file="${1:-}"
+    local verbose="${2:-0}"
+
+    if [ -z "$tex_file" ]; then
+        local pick_status=0
+        tex_file="$(build_pick_tex)" || pick_status=$?
+        if [ "$pick_status" -eq 2 ]; then
+            return 0
+        fi
+        if [ "$pick_status" -ne 0 ]; then
+            return 1
+        fi
+    fi
+
+    if [ -z "$tex_file" ] || [ ! -f "$tex_file" ]; then
+        echo -e "\033[31mError: No .tex file found. $(build_usage)\033[0m"
+        return 1
+    fi
+    if [[ "$tex_file" != *.tex ]]; then
+        echo -e "\033[31mError: File must have .tex extension: $tex_file\033[0m"
+        return 1
+    fi
+
+    local latexmk_bin
+    latexmk_bin="$(build_resolve_latexmk)" || return 1
+    if ! command -v pdflatex >/dev/null 2>&1 && ! command -v pdflatex.exe >/dev/null 2>&1; then
+        echo "Error: pdflatex not found" >&2
+        return 1
+    fi
+
+    local original_dir
+    original_dir="$(pwd)"
+    local tex_file_abs tex_dir base_name build_dir tex_file_name
+    tex_file_abs="$(build_abspath "$tex_file")"
+    tex_dir="$(dirname "$tex_file_abs")"
+    base_name="$(basename "$tex_file_abs" .tex)"
+    build_dir="$tex_dir/.build"
+    tex_file_name="$(basename "$tex_file_abs")"
+    mkdir -p "$build_dir"
+
+    # Always search the source directory (needed for .bib with -output-directory).
+    local tex_dir_engine
+    tex_dir_engine="$(build_engine_path "$tex_dir")"
+    build_prepend_search_path TEXINPUTS "$tex_dir_engine"
+    build_prepend_search_path BIBINPUTS "$tex_dir_engine"
+    build_prepend_search_path BSTINPUTS "$tex_dir_engine"
+
+    local project_root=""
+    project_root="$(build_find_project_root "$tex_dir" || true)"
+    if [ -n "$project_root" ]; then
+        local root_engine
+        root_engine="$(build_engine_path "$project_root")"
+        build_prepend_search_path TEXINPUTS "$root_engine"
+        build_prepend_search_path BIBINPUTS "$root_engine"
+        build_prepend_search_path BSTINPUTS "$root_engine"
+    fi
+
+    local latexmk_args=(
+        -pdf
+        -interaction=nonstopmode
+        -synctex=1
+        -silent
+        -output-directory="$(build_engine_path "$build_dir")"
+    )
+    local rc_file=""
+    if [ -n "$project_root" ]; then
+        rc_file="$(build_rc_file "$project_root")"
+        if [ -n "$rc_file" ]; then
+            latexmk_args+=(-r "$rc_file")
+        fi
+    fi
+
+    cd "$tex_dir" || return 1
+
+    echo ""
+    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    echo -e "\033[1;36m  Compiling: \033[0m\033[36m$tex_file_name\033[0m"
+    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    if [ "$verbose" -eq 1 ]; then
+        echo -e "  \033[2m[latexmk]\033[0m $latexmk_bin"
+    fi
+
+    local start_time end_time elapsed compile_status
+    local capture_path=""
+    capture_path="$(mktemp -t latexmk.XXXXXX 2>/dev/null || mktemp)"
+    start_time="$(date +%s)"
+    set +e
+    if [ "$verbose" -eq 1 ]; then
+        "$latexmk_bin" "${latexmk_args[@]}" "$tex_file_name"
+        compile_status=$?
+    else
+        "$latexmk_bin" "${latexmk_args[@]}" "$tex_file_name" >"$capture_path" 2>&1
+        compile_status=$?
+    fi
+    set -e
+    end_time="$(date +%s)"
+    elapsed=$((end_time - start_time))
+
+    local pdf_path="$build_dir/$base_name.pdf"
+    local log_path="$build_dir/$base_name.log"
+
+    if [ -f "$pdf_path" ] && [ "$compile_status" -eq 0 ]; then
+        build_report_success "$original_dir" "$pdf_path" "$log_path" "$base_name" "$elapsed"
+        cd "$original_dir" || return 1
+        return 0
+    fi
+
+    # latexmk can leave a partial PDF; still treat nonzero as failure.
+    if [ -f "$pdf_path" ] && [ "$compile_status" -ne 0 ]; then
+        build_report_failure "$log_path" "$capture_path"
+        cd "$original_dir" || return 1
+        return 1
+    fi
+
+    build_report_failure "$log_path" "$capture_path"
+    cd "$original_dir" || return 1
+    return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    verbose=0
+    tex_file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose)
+                verbose=1
+                ;;
+            -h|--help)
+                build_usage
+                exit 0
+                ;;
+            --)
+                shift
+                if [ $# -gt 0 ]; then
+                    tex_file="$1"
+                fi
+                break
+                ;;
+            -*)
+                echo "Error: Unknown option: $1" >&2
+                build_usage >&2
+                exit 1
+                ;;
+            *)
+                tex_file="$1"
+                ;;
+        esac
+        shift
+    done
+    build_main "$tex_file" "$verbose"
+fi
