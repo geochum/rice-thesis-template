@@ -41,30 +41,10 @@ build_engine_path() {
     fi
 }
 
-# Walk up from dir; skip $HOME so a user latexmkrc is not a project root.
-build_find_project_root() {
-    local dir="$1"
-    local home="${HOME:-}"
-    while [ -n "$dir" ]; do
-        if [ -n "$home" ] && [ "$dir" = "$home" ]; then
-            return 1
-        fi
-        if [ -f "$dir/.latexmkrc" ] || [ -f "$dir/latexmkrc" ]; then
-            printf '%s\n' "$dir"
-            return 0
-        fi
-        if [ -f "$dir/main.tex" ]; then
-            printf '%s\n' "$dir"
-            return 0
-        fi
-        local parent
-        parent="$(dirname "$dir")"
-        if [ "$parent" = "$dir" ]; then
-            return 1
-        fi
-        dir="$parent"
-    done
-    return 1
+# Directory that contains this script. Shared TeX inputs live here.
+build_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    cd "$(dirname "$(build_abspath "$source")")" && pwd
 }
 
 build_rc_file() {
@@ -186,53 +166,66 @@ build_page_count() {
     printf '%s\n' "$n"
 }
 
-build_pick_tex() {
-    local tex_files=()
+build_tex_files() {
+    local files=()
     local line
     while IFS= read -r line; do
-        tex_files+=("$line")
-    done < <(find . -maxdepth 1 -name "*.tex" -type f | sort)
-
-    if [ ${#tex_files[@]} -eq 0 ]; then
-        echo "Error: No .tex file found. $(build_usage)" >&2
+        files+=("${line#./}")
+    done < <(find . -maxdepth 1 -type f -name '*.tex' ! -name '.*' | sort)
+    if [ ${#files[@]} -eq 0 ]; then
         return 1
     fi
-    if [ ${#tex_files[@]} -eq 1 ]; then
-        echo "${tex_files[0]#./}"
+    printf '%s\n' "${files[@]}"
+}
+
+build_choose_tex() {
+    local files=()
+    local line
+    while IFS= read -r line; do
+        files+=("$line")
+    done < <(build_tex_files) || true
+
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "No .tex files in this directory. $(build_usage)" >&2
+        return 1
+    fi
+    if [ ${#files[@]} -eq 1 ]; then
+        printf '%s\n' "${files[0]}"
         return 0
     fi
     if [ ! -t 0 ]; then
-        echo "Error: Multiple .tex files; pass a path (non-interactive)." >&2
-        local i
-        for i in "${!tex_files[@]}"; do
-            echo "  ${tex_files[i]#./}" >&2
+        echo "Several .tex files in this directory. Pass one:" >&2
+        local name
+        for name in "${files[@]}"; do
+            printf '  %s\n' "$name" >&2
         done
         return 1
     fi
 
     echo "" >&2
-    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m" >&2
-    echo -e "\033[1;36m  Select .tex file to build\033[0m" >&2
-    echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m" >&2
+    echo -e "\033[1;36m  Select a .tex file\033[0m" >&2
     echo "" >&2
     local i
-    for i in "${!tex_files[@]}"; do
-        echo -e "  \033[2m[$((i + 1))]\033[0m \033[36m${tex_files[i]#./}\033[0m" >&2
+    for i in "${!files[@]}"; do
+        echo -e "  \033[2m[$((i + 1))]\033[0m \033[36m${files[i]}\033[0m" >&2
     done
     echo "" >&2
     local selection
-    read -r -p "  Select (1-${#tex_files[@]}) or Enter to cancel: " selection
+    read -r -p "  Select (1-${#files[@]}) or Enter to cancel: " selection
     if [ -z "$selection" ] || [ "$selection" = "q" ] || [ "$selection" = "Q" ]; then
-        echo -e "\033[90mBuild cancelled.\033[0m" >&2
+        echo "Build cancelled." >&2
         return 2
     fi
+    if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+        echo "Invalid selection. Build cancelled." >&2
+        return 1
+    fi
     local selected_index=$((selection - 1))
-    if [ "$selected_index" -ge 0 ] 2>/dev/null && [ "$selected_index" -lt ${#tex_files[@]} ]; then
-        echo -e "\033[32mSelected: ${tex_files[$selected_index]#./}\033[0m" >&2
-        echo "${tex_files[$selected_index]#./}"
+    if [ "$selected_index" -ge 0 ] && [ "$selected_index" -lt ${#files[@]} ]; then
+        printf '%s\n' "${files[$selected_index]}"
         return 0
     fi
-    echo -e "\033[31mInvalid selection. Build cancelled.\033[0m" >&2
+    echo "Invalid selection. Build cancelled." >&2
     return 1
 }
 
@@ -364,9 +357,12 @@ build_main() {
     local tex_file="${1:-}"
     local verbose="${2:-0}"
 
+    local script_dir
+    script_dir="$(build_script_dir)"
+
     if [ -z "$tex_file" ]; then
         local pick_status=0
-        tex_file="$(build_pick_tex)" || pick_status=$?
+        tex_file="$(build_choose_tex)" || pick_status=$?
         if [ "$pick_status" -eq 2 ]; then
             return 0
         fi
@@ -408,15 +404,11 @@ build_main() {
     build_prepend_search_path BIBINPUTS "$tex_dir_engine"
     build_prepend_search_path BSTINPUTS "$tex_dir_engine"
 
-    local project_root=""
-    project_root="$(build_find_project_root "$tex_dir" || true)"
-    if [ -n "$project_root" ]; then
-        local root_engine
-        root_engine="$(build_engine_path "$project_root")"
-        build_prepend_search_path TEXINPUTS "$root_engine"
-        build_prepend_search_path BIBINPUTS "$root_engine"
-        build_prepend_search_path BSTINPUTS "$root_engine"
-    fi
+    local root_engine
+    root_engine="$(build_engine_path "$script_dir")"
+    build_prepend_search_path TEXINPUTS "$root_engine"
+    build_prepend_search_path BIBINPUTS "$root_engine"
+    build_prepend_search_path BSTINPUTS "$root_engine"
 
     local latexmk_args=(
         -pdf
@@ -426,11 +418,9 @@ build_main() {
         -output-directory="$(build_engine_path "$build_dir")"
     )
     local rc_file=""
-    if [ -n "$project_root" ]; then
-        rc_file="$(build_rc_file "$project_root")"
-        if [ -n "$rc_file" ]; then
-            latexmk_args+=(-r "$rc_file")
-        fi
+    rc_file="$(build_rc_file "$script_dir")"
+    if [ -n "$rc_file" ]; then
+        latexmk_args+=(-r "$rc_file")
     fi
 
     cd "$tex_dir" || return 1

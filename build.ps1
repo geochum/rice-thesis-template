@@ -1,13 +1,6 @@
 # Usage: .\build.ps1 [-VerboseBuild] [path/to/file.tex]
 # PDF goes to .build/. Optional: $env:LATEXMK_BIN = path to latexmk
-# Quiet by default. Pass -VerboseBuild (alias -v) to stream latexmk output.
-
-param(
-    [Parameter(Position = 0)]
-    [string]$TexFile = "",
-    [Alias('v')]
-    [switch]$VerboseBuild
-)
+# Quiet by default. Pass -VerboseBuild, -v, or --verbose to stream latexmk output.
 
 function Get-BuildSelfName {
     $path = $PSCommandPath
@@ -31,34 +24,15 @@ function Get-BuildPathSep {
     return ':'
 }
 
-function Find-BuildProjectRoot {
-    param([string]$Dir)
-    $homeDir = $env:HOME
-    if ([string]::IsNullOrEmpty($homeDir)) {
-        $homeDir = $env:USERPROFILE
+function Get-BuildScriptDir {
+    if (-not [string]::IsNullOrEmpty($PSScriptRoot)) {
+        return $PSScriptRoot
     }
-    if ($homeDir) {
-        $homeDir = [System.IO.Path]::GetFullPath($homeDir).TrimEnd('\', '/')
+    $path = $PSCommandPath
+    if ([string]::IsNullOrEmpty($path)) {
+        $path = $MyInvocation.PSCommandPath
     }
-    $dir = [System.IO.Path]::GetFullPath($Dir)
-    while ($dir) {
-        $norm = $dir.TrimEnd('\', '/')
-        if ($homeDir -and ($norm -eq $homeDir)) {
-            return $null
-        }
-        if ((Test-Path (Join-Path $dir '.latexmkrc')) -or (Test-Path (Join-Path $dir 'latexmkrc'))) {
-            return $dir
-        }
-        if (Test-Path (Join-Path $dir 'main.tex')) {
-            return $dir
-        }
-        $parent = [System.IO.Path]::GetDirectoryName($dir)
-        if ([string]::IsNullOrEmpty($parent) -or ($parent -eq $dir)) {
-            return $null
-        }
-        $dir = $parent
-    }
-    return $null
+    return (Split-Path -Parent $path)
 }
 
 function Get-BuildRcFile {
@@ -91,12 +65,13 @@ function Add-BuildTexToPath {
     if ($env:LOCALAPPDATA) {
         $miktex = Join-Path $env:LOCALAPPDATA 'Programs\MiKTeX\miktex\bin\x64'
     }
-    if (-not $miktex -or -not (Test-Path $miktex)) {
+    if ((-not $miktex -or -not (Test-Path -LiteralPath $miktex)) -and $env:USERPROFILE) {
         $miktex = Join-Path $env:USERPROFILE 'AppData\Local\Programs\MiKTeX\miktex\bin\x64'
     }
-    if (Test-Path $miktex) { $extra.Add($miktex) }
+    if ($miktex -and (Test-Path -LiteralPath $miktex)) { $extra.Add($miktex) }
+    $sep = Get-BuildPathSep
     foreach ($p in $extra) {
-        $env:PATH = "$p;$env:PATH"
+        $env:PATH = "$p$sep$env:PATH"
     }
 }
 
@@ -130,8 +105,8 @@ function Get-BuildPatternCount {
 
 function Get-BuildPdfSize {
     param([string]$Pdf)
-    if (-not (Test-Path $Pdf)) { return '' }
-    $sizeBytes = (Get-Item $Pdf).Length
+    if (-not (Test-Path -LiteralPath $Pdf -PathType Leaf)) { return '' }
+    $sizeBytes = (Get-Item -LiteralPath $Pdf -Force).Length
     if ($sizeBytes -lt 1024) { return "$sizeBytes" }
     if ($sizeBytes -lt 1048576) { return "$([math]::Floor($sizeBytes / 1024))K" }
     $sizeMb = [math]::Round($sizeBytes / 1MB, 1)
@@ -164,25 +139,26 @@ function Test-BuildInteractive {
     }
 }
 
-function Get-BuildTexPick {
-    $texFiles = @(Get-ChildItem -Path . -Filter '*.tex' -File | Sort-Object Name)
+function Get-BuildTexChoice {
+    $texFiles = @(
+        Get-ChildItem -Path . -Filter '*.tex' -File |
+            Where-Object { -not $_.Name.StartsWith('.') } |
+            Sort-Object Name
+    )
     if ($texFiles.Count -eq 0) {
-        Write-Host "Error: No .tex file found. $(Get-BuildUsage)" -ForegroundColor Red
+        Write-Host "No .tex files in this directory. $(Get-BuildUsage)" -ForegroundColor Red
         return @{ Status = 1; File = '' }
     }
     if ($texFiles.Count -eq 1) {
         return @{ Status = 0; File = $texFiles[0].Name }
     }
     if (-not (Test-BuildInteractive)) {
-        Write-Host "Error: Multiple .tex files; pass a path (non-interactive)." -ForegroundColor Red
-        foreach ($f in $texFiles) { Write-Host "  $($f.Name)" -ForegroundColor DarkGray }
+        Write-Host "Several .tex files in this directory. Pass one:" -ForegroundColor Red
+        foreach ($f in $texFiles) { Write-Host "  $($f.Name)" }
         return @{ Status = 1; File = '' }
     }
-    $separator = "------------------------------------------------------------------------------"
     Write-Host ""
-    Write-Host $separator -ForegroundColor Cyan
-    Write-Host "  Select .tex file to build" -ForegroundColor Cyan
-    Write-Host $separator -ForegroundColor Cyan
+    Write-Host "  Select a .tex file" -ForegroundColor Cyan
     Write-Host ""
     for ($i = 0; $i -lt $texFiles.Count; $i++) {
         Write-Host "  [$($i + 1)] " -NoNewline -ForegroundColor DarkGray
@@ -191,19 +167,17 @@ function Get-BuildTexPick {
     Write-Host ""
     $selection = Read-Host "  Select (1-$($texFiles.Count)) or Enter to cancel"
     if ($selection -eq '' -or $selection -eq 'q' -or $selection -eq 'Q') {
-        Write-Host "Build cancelled." -ForegroundColor DarkGray
+        Write-Host "Build cancelled."
         return @{ Status = 2; File = '' }
     }
-    try {
-        $selectedIndex = [int]$selection - 1
-    } catch {
+    $selectedIndex = 0
+    if (-not [int]::TryParse($selection, [ref]$selectedIndex)) {
         Write-Host "Invalid selection. Build cancelled." -ForegroundColor Red
         return @{ Status = 1; File = '' }
     }
+    $selectedIndex = $selectedIndex - 1
     if ($selectedIndex -ge 0 -and $selectedIndex -lt $texFiles.Count) {
-        $name = $texFiles[$selectedIndex].Name
-        Write-Host "Selected: $name" -ForegroundColor Green
-        return @{ Status = 0; File = $name }
+        return @{ Status = 0; File = $texFiles[$selectedIndex].Name }
     }
     Write-Host "Invalid selection. Build cancelled." -ForegroundColor Red
     return @{ Status = 1; File = '' }
@@ -340,9 +314,11 @@ function Invoke-BuildLatexmk {
             if ($null -eq $LASTEXITCODE) { return 1 }
             return $LASTEXITCODE
         }
-        & $Bin @allArgs
-        if ($null -eq $LASTEXITCODE) { return 1 }
-        return $LASTEXITCODE
+        # Out-Host shows latexmk output without mixing it into the exit code.
+        & $Bin @allArgs | Out-Host
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $exitCode) { return 1 }
+        return $exitCode
     }
     if ($Bin -like '*.ps1') {
         & powershell.exe -NoProfile -File $Bin -- @allArgs *> $CapturePath
@@ -365,12 +341,12 @@ function Invoke-BuildMain {
     $originalDir = Get-Location
     try {
         if ([string]::IsNullOrEmpty($TexFile)) {
-            $pick = Get-BuildTexPick
+            $pick = Get-BuildTexChoice
             if ($pick.Status -eq 2) { return 0 }
             if ($pick.Status -ne 0) { return 1 }
             $TexFile = $pick.File
         }
-        if ([string]::IsNullOrEmpty($TexFile) -or -not (Test-Path $TexFile)) {
+        if ([string]::IsNullOrEmpty($TexFile) -or -not (Test-Path -LiteralPath $TexFile -PathType Leaf)) {
             Write-Host "Error: No .tex file found. $(Get-BuildUsage)" -ForegroundColor Red
             return 1
         }
@@ -386,7 +362,12 @@ function Invoke-BuildMain {
             return 1
         }
 
-        $texFileAbs = (Resolve-Path $TexFile).Path
+        $texItem = Get-Item -LiteralPath $TexFile -Force
+        if ($texItem.LinkType) {
+            $texTarget = $texItem.ResolveLinkTarget($true)
+            if ($texTarget) { $texItem = $texTarget }
+        }
+        $texFileAbs = $texItem.FullName
         $texDir = Split-Path -Parent $texFileAbs
         $baseName = [System.IO.Path]::GetFileNameWithoutExtension($texFileAbs)
         $buildDir = Join-Path $texDir '.build'
@@ -397,12 +378,10 @@ function Invoke-BuildMain {
         Add-BuildSearchPath 'BIBINPUTS' $texDir
         Add-BuildSearchPath 'BSTINPUTS' $texDir
 
-        $projectRoot = Find-BuildProjectRoot $texDir
-        if ($projectRoot) {
-            Add-BuildSearchPath 'TEXINPUTS' $projectRoot
-            Add-BuildSearchPath 'BIBINPUTS' $projectRoot
-            Add-BuildSearchPath 'BSTINPUTS' $projectRoot
-        }
+        $scriptDir = Get-BuildScriptDir
+        Add-BuildSearchPath 'TEXINPUTS' $scriptDir
+        Add-BuildSearchPath 'BIBINPUTS' $scriptDir
+        Add-BuildSearchPath 'BSTINPUTS' $scriptDir
 
         $latexmkArgs = @(
             '-pdf',
@@ -411,11 +390,9 @@ function Invoke-BuildMain {
             '-silent',
             "-output-directory=$buildDir"
         )
-        if ($projectRoot) {
-            $rcFile = Get-BuildRcFile $projectRoot
-            if ($rcFile) {
-                $latexmkArgs += @('-r', $rcFile)
-            }
+        $rcFile = Get-BuildRcFile $scriptDir
+        if ($rcFile) {
+            $latexmkArgs += @('-r', $rcFile)
         }
 
         Set-Location $texDir
@@ -451,24 +428,29 @@ function Invoke-BuildMain {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    $showLatexmk = [bool]$VerboseBuild
-    $candidates = @()
-    if (-not [string]::IsNullOrEmpty($TexFile)) {
-        $candidates += $TexFile
-    }
-    foreach ($cliArg in $args) {
-        $candidates += [string]$cliArg
-    }
+    $showLatexmk = $false
     $texArg = ''
-    foreach ($cliArg in $candidates) {
-        if ($cliArg -in @('-v', '--verbose', '-Verbose', '-VerboseBuild')) {
+    $endOfOptions = $false
+    foreach ($cliArg in @($args)) {
+        $text = [string]$cliArg
+        if (-not $endOfOptions -and $text -eq '--') {
+            $endOfOptions = $true
+            continue
+        }
+        if (-not $endOfOptions -and ($text -in @('-v', '--verbose', '-Verbose', '-VerboseBuild'))) {
             $showLatexmk = $true
             continue
         }
-        if ($cliArg -like '-*') {
-            continue
+        if (-not $endOfOptions -and ($text -in @('-h', '--help'))) {
+            Write-Host (Get-BuildUsage)
+            exit 0
         }
-        $texArg = $cliArg
+        if (-not $endOfOptions -and $text.StartsWith('-')) {
+            Write-Host "Error: Unknown option: $text" -ForegroundColor Red
+            Write-Host (Get-BuildUsage)
+            exit 1
+        }
+        $texArg = $text
     }
     exit (Invoke-BuildMain -TexFile $texArg -ShowLatexmk $showLatexmk)
 }
